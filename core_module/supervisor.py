@@ -219,15 +219,18 @@ class TranscrapeSupervisor:
             self.start_all()
         self._loop.run_until_complete(asyncio.wait_for(self._all_waiter_coro, timeout=None))
 
+    @property
+    def status_str(self):
+        string = f'分享链接获取任务：\n\t共{len(list(self.scrape_tasks))}个，' \
+                 f'成功{len([task for task in self.scrape_tasks if task.successful])}个，' \
+                 f'错误{len([task for task in self.scrape_tasks if task.error])}个' \
+                 f'网盘转存任务：\n\t共{len(list(self.transfer_tasks))}个，' \
+                 f'成功{len([task for task in self.transfer_tasks if task.successful])}个，' \
+                 f'错误{len([task for task in self.transfer_tasks if task.error])}个'
+        return string
+
     def print_status(self):
-        print('分享链接获取任务：')
-        print(f'\t共{len(list(self.scrape_tasks))}个，'
-              f'\t已完成{len([task for task in self.scrape_tasks if task.finished])}个，'
-              f'\t错误{len([task for task in self.scrape_tasks if task.error])}个')
-        print('网盘转存任务：')
-        print(f'\t共{len(list(self.transfer_tasks))}个，'
-              f'\t已完成{len([task for task in self.transfer_tasks if task.finished])}个，'
-              f'\t错误{len([task for task in self.transfer_tasks if task.error])}个')
+        print(self.status_str)
 
     async def async_print_status(self, interval: float = 0.25, last_update:float = 1):
         while True:
