@@ -153,3 +153,5 @@ cython_debug/
 
 # custom tests
 test*.py
+persistent_data/
+.dpd

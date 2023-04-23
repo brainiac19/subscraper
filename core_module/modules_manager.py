@@ -3,8 +3,8 @@ import importlib
 import inspect
 import itertools
 import os
-import sys
 from pathlib import Path
+
 from core_module.base.driver import Driver, TransferDriver, ScrapeDriver
 from core_module.base.task import Task, TransferTask, ScrapeTask
 

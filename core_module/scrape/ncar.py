@@ -6,12 +6,12 @@ from enum import Flag
 
 from bs4 import BeautifulSoup as bs
 
-from core_module.base.task import ScrapeTarget, TransferFlag, ScrapeTask
 from core_module.base.driver import ScrapeDriver
-from core_module.transfer.baidu import BaiduTransferDriver
-from core_module.transfer.aliyun import AliTransferDriver
-from utils.bs4_util import text_between
+from core_module.base.task import ScrapeTarget, TransferFlag, ScrapeTask
 from core_module.modules_manager import ModulesManager
+from core_module.transfer.aliyun import AliTransferDriver
+from core_module.transfer.baidu import BaiduTransferDriver
+from utils.bs4_util import text_between
 
 
 class NcarCaptions:
@@ -44,7 +44,7 @@ class NcarScrapeDriver(ScrapeDriver):
 
     def __init__(self):
         super().__init__()
-        self._s = self._build_session(headers={
+        self.s = self._build_session(headers={
             'authority': 'mcar.vip',
             'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh-TW;q=0.7,zh;q=0.6',
             'dnt': '1',
@@ -70,7 +70,7 @@ class NcarScrapeDriver(ScrapeDriver):
 
     async def _scrape_single(self, queue: asyncio.Queue, task: NcarScrapeTask):
         task.start()
-        async with self._s.get(task.url) as resp:
+        async with self.s.get(task.url) as resp:
             soup = bs(await resp.text(), 'lxml')
 
             try:
@@ -97,9 +97,8 @@ class NcarScrapeDriver(ScrapeDriver):
                                 text = text_between(share, share.find_next('br'))
                                 code_match = re.search(r'\W(\w{4})\s?$', text)
                                 code = code_match.group(1) if code_match else None
-                                task = self._modman.create_transfer_task(url, target.target_dir, code, target.flags)
-                                await queue.put(task)
-                                await asyncio.sleep(0)
+                                transfer_task = self._modman.create_transfer_task(url, target.target_dir, code, target.flags)
+                                await queue.put(transfer_task)
                     except AttributeError:
                         continue
         task.finish(True)
@@ -110,6 +109,12 @@ class NcarScrapeDriver(ScrapeDriver):
             async_tasks.append(self._loop.create_task(self._scrape_single(queue, task)))
         return async_tasks
 
-
     async def close(self):
-        await self._s.close()
+        if not self.s.closed:
+            await self.s.close()
+
+    def __aenter__(self):
+        return self
+
+    def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._loop.run_until_complete(self.close())

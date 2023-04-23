@@ -1,7 +1,5 @@
 import enum
-import re
 import time
-import typing
 from enum import Flag, auto
 from pathlib import PurePosixPath
 
@@ -32,16 +30,28 @@ class Task:
     def set_name(self, name):
         self.task_name = name
 
+    @property
+    def status_str(self):
+        for name, val in vars(Status).items():
+            if self.status == val:
+                return name
+        return 'UNKNOWN'
+
+
+    @property
     def started(self):
         return True if self.status == Status.STARTED else False
 
+    @property
     def finished(self):
-        return True if self.status == Status.SUCCESS or Status.ERROR else False
+        return True if self.status == Status.SUCCESS or self.status == Status.ERROR else False
 
+    @property
     def successful(self):
         return True if self.status == Status.SUCCESS else False
 
-    def failed(self):
+    @property
+    def error(self):
         return True if self.status == Status.ERROR else False
 
 

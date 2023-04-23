@@ -3,6 +3,8 @@ import json
 import re
 import typing
 import warnings
+
+warnings.simplefilter('always', UserWarning)
 from collections import defaultdict
 from enum import Flag
 from pathlib import PurePosixPath
@@ -13,10 +15,101 @@ from aiohttp_client_cache import CacheBackend
 from ordered_set import OrderedSet
 
 from core_module.base.driver import DirectoryItem, DirectoryDriver, HttpResponseErrorHandler, TransferDriver, \
-    ErrorHandler, ResponseCode, ResponseError
+    ErrorHandler, ResponseCode, ResponseError, AuthDriver
 from core_module.base.task import TransferTask, TransferFlag
 from tool_module.aio_throttled_cached_session import ThrottledCachedSession
+from utils.async_io import class_decorator
 from utils.http_util import ck_str_to_dict
+
+
+class BaiduAuthErrorHandler(ErrorHandler):
+    SUCCESS = ResponseCode(0, '成功')
+    INVALID_URL = ResponseCode(105, '无效的URL')
+    TOO_MANY_FAILS = ResponseCode(-62, '请求过于频繁，请稍后再试')
+    INVALID_LOGIN = ResponseCode(-4, '无效的登录，请注销其它终端的登录')
+
+    @classmethod
+    def success(cls, errno: int | typing.Any):
+        if errno == cls.SUCCESS.id:
+            return True
+        else:
+            return False
+
+
+class BaiduAuthDriver(AuthDriver):
+    regex = re.compile(r'https?://pan\.baidu\.com.*?')
+    batch_optimized = False
+
+    def __init__(self, cookies: str | dict = None, bds_token: str = None, aio_session: aiohttp.ClientSession = None):
+        super().__init__()
+        if type(cookies) is str:
+            cookies = ck_str_to_dict(cookies)
+        if aio_session:
+            self.s = aio_session
+            self.s.cookie_jar.update_cookies(cookies)
+        else:
+            self.s = self._build_session(
+                aio_session=ThrottledCachedSession,
+                headers={'Host': 'pan.baidu.com',
+                         'Connection': 'keep-alive',
+                         'Upgrade-Insecure-Requests': '1',
+                         'Sec-Fetch-Dest': 'document',
+                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.39',
+                         'Sec-Fetch-Site': 'same-site',
+                         'Sec-Fetch-Mode': 'navigate',
+                         'Referer': 'https://pan.baidu.com',
+                         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7,en-GB;q=0.6,ru;q=0.5'},
+                cookie_jar=aiohttp.CookieJar(quote_cookie=False), cookies=cookies,
+                cache=CacheBackend(allowed_methods=('GET', 'HEAD', 'POST'), allowed_codes=(200, 201, 202)))
+        self.cookies = cookies
+        self._bds_token = bds_token
+
+    @property
+    def persistent_data(self):
+        data = {
+            'cookies': self.cookies
+        }
+        return data
+
+    @persistent_data.setter
+    def persistent_data(self, value):
+        self.cookies = value['cookies']
+        self.s.cookie_jar.update_cookies(value['cookies'])
+
+    @staticmethod
+    def require_bds_token(func):
+        def ensure_req(self):
+            if self._bds_token is None:
+                self._bds_token = self._loop.run_until_complete(self._get_bdstoken())
+
+        return class_decorator(ensure_req, func)
+
+    async def _get_bdstoken(self):
+        url = 'https://pan.baidu.com/api/gettemplatevariable'
+        params = {
+            'clienttype': '0',
+            'app_id': '250528',
+            'web': '1',
+            'fields': '["bdstoken", "token", "uk", "isdocuser", "servertime"]'
+        }
+        async with self.s.get(url, params=params) as resp:
+            txt = await resp.text()
+            if not HttpResponseErrorHandler.success(resp.status):
+                raise HttpResponseErrorHandler.id(resp.status, txt).exception
+            js = await resp.json()
+            if BaiduAuthErrorHandler.success(js['errno']):
+                return js['result']['bdstoken']
+            else:
+                raise BaiduAuthErrorHandler.id(js['errno']).exception
+
+    @property
+    @require_bds_token
+    def bds_token(self):
+        return self._bds_token
+
+    async def close(self):
+        if not self.s.closed:
+            await self.s.close()
 
 
 class BaiduDirectoryErrorHandler(ErrorHandler):
@@ -43,7 +136,7 @@ class BaiduDirectoryItem(DirectoryItem):
                          self.path.name)
 
     @staticmethod
-    def calc_id(path: PurePosixPath | str, is_dir:bool):
+    def calc_id(path: PurePosixPath | str, is_dir: bool):
         path = path if isinstance(path, PurePosixPath) else PurePosixPath(path)
         return path.as_posix() + '//' + str(is_dir)
 
@@ -52,53 +145,19 @@ class BaiduDirectoryDriver(DirectoryDriver):
     regex = re.compile(r'https?://pan\.baidu\.com.*?')
     batch_optimized = False
 
-    def __init__(self, cookies: str | dict = None, bds_token: str = None, aio_session: aiohttp.ClientSession = None):
+    def __init__(self, *, cookies: str | dict = None, bds_token: str = None, aio_session: aiohttp.ClientSession = None,
+                 auth_driver: BaiduAuthDriver = None):
         super().__init__()
-        if aio_session:
-            self._s = aio_session
+        if auth_driver:
+            self.auth_driver = auth_driver
+
         else:
-            if not cookies or not cookies.isascii() or 'BAIDUID' not in cookies:
-                raise Exception("Invalid init params")
-
-            if type(cookies) is str:
-                cookies = ck_str_to_dict(cookies)
-
-            self._s = self._build_session(
-                aio_session=ThrottledCachedSession,
-                headers={'Host': 'pan.baidu.com',
-                         'Connection': 'keep-alive',
-                         'Upgrade-Insecure-Requests': '1',
-                         'Sec-Fetch-Dest': 'document',
-                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.39',
-                         'Sec-Fetch-Site': 'same-site',
-                         'Sec-Fetch-Mode': 'navigate',
-                         'Referer': 'https://pan.baidu.com',
-                         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7,en-GB;q=0.6,ru;q=0.5'},
-                cookie_jar=aiohttp.CookieJar(quote_cookie=False), cookies=cookies,
-                cache=CacheBackend(allowed_methods=('GET', 'HEAD', 'POST')))
-            self._s.set_host_rate_limit('pan.baidu.com', 20)
-        self._bds_token = bds_token if bds_token else self._loop.run_until_complete(self._get_bdstoken())
+            self.auth_driver = BaiduAuthDriver(cookies, bds_token, aio_session)
+        self.s = self.auth_driver.s
+        self.s.set_host_rate_limit('pan.baidu.com', 10)
         self._mkpath_mutex = asyncio.Lock()
 
-    async def _get_bdstoken(self):
-        url = 'https://pan.baidu.com/api/gettemplatevariable'
-        params = {
-            'clienttype': '0',
-            'app_id': '250528',
-            'web': '1',
-            'fields': '["bdstoken", "token", "uk", "isdocuser", "servertime"]'
-        }
-        async with self._s.get(url, params=params) as resp:
-            txt = await resp.text()
-            if not HttpResponseErrorHandler.success(resp.status):
-                raise HttpResponseErrorHandler.id(resp.status, txt).exception
-            js = await resp.json()
-            if BaiduTransferErrorHandler.success(js['errno']):
-                return js['result']['bdstoken']
-            else:
-                raise BaiduTransferErrorHandler.id(js['errno']).exception
-
-    async def ls(self, path: PurePosixPath|str = PurePosixPath('/'), renew=False) -> dict | OrderedSet[
+    async def ls(self, path: PurePosixPath | str = PurePosixPath('/'), renew=False) -> dict | OrderedSet[
         BaiduDirectoryItem] | typing.Any:
         path = path if isinstance(path, PurePosixPath) else PurePosixPath(path)
         url = 'https://pan.baidu.com/api/list'
@@ -110,10 +169,10 @@ class BaiduDirectoryDriver(DirectoryDriver):
             'page': '1',
             'num': '1000',
             'dir': path.as_posix(),
-            'bdstoken': self._bds_token
+            'bdstoken': self.auth_driver.bds_token
         }
-        async with self._s.cache_disabled():
-            async with self._s.get(url, params=params) as resp:
+        async with self.s.cache_disabled():
+            async with self.s.get(url, params=params) as resp:
                 txt = await resp.text()
                 if not HttpResponseErrorHandler.success(resp.status):
                     raise HttpResponseErrorHandler.id(resp.status, txt).exception
@@ -136,7 +195,7 @@ class BaiduDirectoryDriver(DirectoryDriver):
         await self.ls(dir_item.path.parent)
         return self.cache_exists(dir_item)
 
-    async def mkpath(self, path: PurePosixPath|str):
+    async def mkpath(self, path: PurePosixPath | str):
         await self._mkpath_mutex.acquire()
         path = path if isinstance(path, PurePosixPath) else PurePosixPath(path)
         dir_item = BaiduDirectoryItem(path, True)
@@ -147,14 +206,14 @@ class BaiduDirectoryDriver(DirectoryDriver):
         url = 'https://pan.baidu.com/api/create'
         params = {
             'a': 'commit',
-            'bdstoken': self._bds_token
+            'bdstoken': self.auth_driver.bds_token
         }
         data = {
             'path': path.as_posix(),
             'isdir': '1',
             'block_list': '[]'
         }
-        async with self._s.post(url, params=params, data=data) as resp:
+        async with self.s.post(url, params=params, data=data) as resp:
             txt = await resp.text()
             if not HttpResponseErrorHandler.success(resp.status):
                 raise HttpResponseErrorHandler.id(resp.status, txt).exception
@@ -168,8 +227,8 @@ class BaiduDirectoryDriver(DirectoryDriver):
                 raise BaiduDirectoryErrorHandler.id(js['errno']).exception
 
     async def close(self):
-        if not self._s.closed:
-            await self._s.close()
+        if not self.s.closed:
+            await self.s.close()
 
 
 class BaiduTransferErrorHandler(ErrorHandler):
@@ -212,35 +271,33 @@ class BaiduTransferDriver(TransferDriver):
     regex = re.compile(r'https?://pan\.baidu\.com.*?')
     batch_optimized = False
 
-    def __init__(self, cookies: str | dict = None, bds_token: str = None, aio_session: aiohttp.ClientSession = None):
+    def __init__(self, cookies: str | dict = None, bds_token: str = None, aio_session: aiohttp.ClientSession = None,
+                 auth_driver: BaiduAuthDriver = None):
         super().__init__()
-        if aio_session:
-            self._s = aio_session
+        if auth_driver:
+            self.auth_driver = auth_driver
+
         else:
-            if not cookies or not cookies.isascii() or 'BAIDUID' not in cookies:
-                raise Exception("Invalid init params")
-
-            if type(cookies) is str:
-                cookies = ck_str_to_dict(cookies)
-
-            self._s = self._build_session(
-                aio_session=ThrottledCachedSession,
-                headers={'Host': 'pan.baidu.com',
-                         'Connection': 'keep-alive',
-                         'Upgrade-Insecure-Requests': '1',
-                         'Sec-Fetch-Dest': 'document',
-                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.39',
-                         'Sec-Fetch-Site': 'same-site',
-                         'Sec-Fetch-Mode': 'navigate',
-                         'Referer': 'https://pan.baidu.com',
-                         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7,en-GB;q=0.6,ru;q=0.5'},
-                cookie_jar=aiohttp.CookieJar(quote_cookie=False), cookies=cookies,
-                cache=CacheBackend(allowed_methods=('GET', 'HEAD', 'POST'), limit=10))
-            self._s.set_host_rate_limit('pan.baidu.com', 10)
-
-        self._bds_token = bds_token if bds_token else self._loop.run_until_complete(self._get_bdstoken())
-        self._dir_driver = BaiduDirectoryDriver(bds_token=self._bds_token, aio_session=self._s)
+            self.auth_driver = BaiduAuthDriver(cookies, bds_token, aio_session)
+        self.s = self.auth_driver.s
+        self.s.set_host_rate_limit('pan.baidu.com', 10)
+        self.dir_driver = BaiduDirectoryDriver(auth_driver=self.auth_driver)
         self._task_mutex = defaultdict(asyncio.Lock)
+        self._bdclnd_mutex = defaultdict(asyncio.Lock)
+        self._bdclnd_cache = {}
+
+    @property
+    def persistent_data(self):
+        data = {
+            'auth_driver_persistent_data': self.auth_driver.persistent_data,
+            'bdclnd_cache': self._bdclnd_cache
+        }
+        return data
+
+    @persistent_data.setter
+    def persistent_data(self, value):
+        self._bdclnd_cache = value['bdclnd_cache']
+        self.auth_driver.persistent_data = value['auth_driver_persistent_data']
 
     async def _get_bdstoken(self):
         url = 'https://pan.baidu.com/api/gettemplatevariable'
@@ -250,7 +307,7 @@ class BaiduTransferDriver(TransferDriver):
             'web': '1',
             'fields': '["bdstoken", "token", "uk", "isdocuser", "servertime"]'
         }
-        async with self._s.get(url, params=params) as resp:
+        async with self.s.get(url, params=params) as resp:
             txt = await resp.text()
             if not HttpResponseErrorHandler.success(resp.status):
                 raise HttpResponseErrorHandler.id(resp.status, txt).exception
@@ -261,10 +318,11 @@ class BaiduTransferDriver(TransferDriver):
                 raise BaiduTransferErrorHandler.id(js['errno']).exception
 
     async def _get_bdclnd(self, share_url: str, code: str = None):
+        await self._bdclnd_mutex[share_url].acquire()
         verify_url = 'https://pan.baidu.com/share/verify'
         params = {
             'surl': re.search(r'https?://pan\.baidu\.com/s/1(.*)\??', share_url).group(1),
-            'bdstoken': self._bds_token,
+            'bdstoken': self.auth_driver.bds_token,
             'channel': 'chunlei',
             'web': '1',
             'clienttype': '0'
@@ -274,19 +332,23 @@ class BaiduTransferDriver(TransferDriver):
             'vcode': '',
             'vcode_str': ''
         }
-        async with self._s.post(verify_url, params=params, data=data) as resp:
+        async with self.s.post(verify_url, params=params, data=data) as resp:
             txt = await resp.text()
             if not HttpResponseErrorHandler.success(resp.status):
                 raise HttpResponseErrorHandler.id(resp.status, txt).exception
             js = await resp.json()
+            self._bdclnd_mutex[share_url].release()
             if BaiduTransferErrorHandler.success(js['errno']):
+                self._bdclnd_cache[share_url] = js['randsk']
                 return js['randsk']
             else:
                 raise BaiduTransferErrorHandler.id(js['errno']).exception
 
     async def _get_share_info(self, share_url: str, bdclnd: str = None):
-        async with self._s.get(share_url, cookies={'BDCLND': bdclnd} if bdclnd else None
-                , headers={
+        async with self.s.get(
+                share_url,
+                cookies={'BDCLND': bdclnd} if bdclnd else None,
+                headers={
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                     'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh-TW;q=0.7,zh;q=0.6',
                     'Connection': 'keep-alive',
@@ -316,7 +378,7 @@ class BaiduTransferDriver(TransferDriver):
         params = {
             'shareid': share_id,
             'from': share_uk,
-            'bdstoken': self._bds_token,
+            'bdstoken': self.auth_driver.bds_token,
             'channel': 'chunlei',
             'web': '1',
             'clienttype': '0'
@@ -325,7 +387,7 @@ class BaiduTransferDriver(TransferDriver):
             'fsidlist': f'[{",".join(str(s) for s in fs_id_list)}]',
             'path': target_dir
         }
-        async with self._s.post(url, params=params, data=data, cookies={'BDCLND': bdclnd} if bdclnd else None) as resp:
+        async with self.s.post(url, params=params, data=data, cookies={'BDCLND': bdclnd} if bdclnd else None) as resp:
             txt = await resp.text()
             if not HttpResponseErrorHandler.success(resp.status):
                 raise HttpResponseErrorHandler.id(resp.status, txt).exception
@@ -358,7 +420,7 @@ class BaiduTransferDriver(TransferDriver):
             for file in share_file_list:
                 future_dir_item = BaiduDirectoryItem(task.target_dir.joinpath(file['server_filename']),
                                                      True if file['isdir'] == 1 else False)
-                if TransferFlag.force in task.flags or (not await self._dir_driver.exists(future_dir_item)):
+                if TransferFlag.force in task.flags or (not await self.dir_driver.exists(future_dir_item)):
                     fs_list.append(file['fs_id'])
                     future_dir_items.append(future_dir_item)
 
@@ -369,12 +431,12 @@ class BaiduTransferDriver(TransferDriver):
 
             try:
                 if TransferFlag.create_parents in task.flags:
-                    await self._dir_driver.mkpath(task.target_dir)
+                    await self.dir_driver.mkpath(task.target_dir)
                 result = await self._transfer_single_internal(task.target_dir, share_id, share_uk, fs_list, bdclnd)
             except ResponseError as e:
                 raise e
             if result:
-                self._dir_driver.cache_add(task.target_dir.as_posix(), future_dir_items)
+                self.dir_driver.cache_add(task.target_dir.as_posix(), future_dir_items)
             task.finish(result)
         except ResponseError as e:
             warnings.warn(f"{task.url + f'?pwd={task.code}' if task.code else ''} 转存失败：{e.description}")
@@ -389,5 +451,11 @@ class BaiduTransferDriver(TransferDriver):
         return async_tasks
 
     async def close(self):
-        if not self._s.closed:
-            await self._s.close()
+        if not self.s.closed:
+            await self.s.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._loop.run_until_complete(self.close())

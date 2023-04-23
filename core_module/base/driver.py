@@ -13,15 +13,6 @@ from utils.common import ordset_rm
 
 
 class Driver(ABC):
-    def __init__(self):
-        self._loop = asyncio.get_event_loop()
-
-    def _build_session(self, aio_session=aiohttp.ClientSession, *args, **kwargs):
-        return self._loop.run_until_complete(self._build_session_async(aio_session, *args, **kwargs))
-
-    async def _build_session_async(self, aio_session=aiohttp.ClientSession, *args, **kwargs):
-        return aio_session(*args, **kwargs)
-
     @property
     @abstractmethod
     def regex(self) -> typing.Pattern:
@@ -32,10 +23,29 @@ class Driver(ABC):
     def batch_optimized(self) -> bool:
         ...
 
+    @property
+    def persistent_data(self):
+        return None
+
+    @persistent_data.setter
+    def persistent_data(self, value):
+        pass
+
+    def __init__(self):
+        self._loop = asyncio.get_event_loop()
+
+    def _build_session(self, aio_session=aiohttp.ClientSession, *args, **kwargs):
+        return self._loop.run_until_complete(self._build_session_async(aio_session, *args, **kwargs))
+
+    async def _build_session_async(self, aio_session=aiohttp.ClientSession, *args, **kwargs):
+        return aio_session(*args, **kwargs)
+
+
+class AuthDriver(Driver):
+    ...
+
 
 class ScrapeDriver(Driver):
-    def __init__(self):
-        super().__init__()
 
     @abstractmethod
     def scrape(self, queue: Queue, *tasks: Task) -> Iterable[asyncio.Task]:
@@ -86,7 +96,7 @@ class DirectoryDriver(Driver, ABC):
         else:
             self._dir_cache[unique_parent_id].append(items)
 
-    def cache_ls(self, unique_parent_id: str) -> OrderedSet[DirectoryItem]|None:
+    def cache_ls(self, unique_parent_id: str) -> OrderedSet[DirectoryItem] | None:
         if unique_parent_id not in self._dir_cache.keys():
             return None
         else:
@@ -121,9 +131,7 @@ class DirectoryDriver(Driver, ABC):
             self._dir_cache[unique_parent_id].remove(items)
 
 
-class TransferDriver(Driver):
-    def __init__(self):
-        super().__init__()
+class TransferDriver(Driver, ABC):
 
     @abstractmethod
     def transfer(self, *tasks: Task) -> Iterable[asyncio.Task]:
@@ -151,16 +159,19 @@ class ErrorHandler(ABC):
     UNKNOWN_ERROR = ResponseCode(None, 'Unknown error')
 
     @classmethod
-    def id(cls, errno: int | typing.Any, errmsg=''):
+    def id(cls, errno, errmsg=''):
         if errno is None:
-            return cls.UNKNOWN_ERROR
+            if errmsg:
+                return ResponseCode(errno, errmsg)
+            else:
+                return cls.UNKNOWN_ERROR
         for k, v in dict(vars(cls)).items():
             if isinstance(v, ResponseCode) and errno == v.id:
                 return v
         return ResponseCode(errno, errmsg)
 
     @abstractmethod
-    def success(self, errno: int):
+    def success(self, errno):
         ...
 
 
@@ -170,7 +181,7 @@ class HttpResponseErrorHandler(ErrorHandler):
     Accepted = ResponseCode(202, 'Accepted')
 
     @classmethod
-    def success(cls, errno: int | typing.Any):
+    def success(cls, errno):
         if not isinstance(errno, int):
             errno = int(errno)
         if errno == cls.SUCCESS.id or errno == cls.POST_SUCCESS.id or errno == cls.Accepted.id:
