@@ -229,7 +229,7 @@ class TranscrapeSupervisor:
               f'\t已完成{len([task for task in self.transfer_tasks if task.finished])}个，'
               f'\t错误{len([task for task in self.transfer_tasks if task.error])}个')
 
-    async def async_print_status(self, interval: float = 0.25, last_update:int = 1):
+    async def async_print_status(self, interval: float = 0.25, last_update:float = 1):
         while True:
             try:
                 self.print_status()
@@ -240,8 +240,8 @@ class TranscrapeSupervisor:
             await asyncio.sleep(last_update)
             self.print_status()
 
-    def start_update_status(self):
-        self._status_updater_coro = self._loop.create_task(self.async_print_status())
+    def start_update_status(self, interval:float = 0.25, last_update:float = 1):
+        self._status_updater_coro = self._loop.create_task(self.async_print_status(interval, last_update))
 
     def stop_update_status(self):
         if self._status_updater_coro:
