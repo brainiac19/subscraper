@@ -224,7 +224,7 @@ class TranscrapeSupervisor:
         string = f'分享链接获取任务：\n\t共{len(list(self.scrape_tasks))}个，' \
                  f'成功{len([task for task in self.scrape_tasks if task.successful])}个，' \
                  f'错误{len([task for task in self.scrape_tasks if task.error])}个' \
-                 f'网盘转存任务：\n\t共{len(list(self.transfer_tasks))}个，' \
+                 f'\n网盘转存任务：\n\t共{len(list(self.transfer_tasks))}个，' \
                  f'成功{len([task for task in self.transfer_tasks if task.successful])}个，' \
                  f'错误{len([task for task in self.transfer_tasks if task.error])}个'
         return string
