@@ -16,6 +16,7 @@ async def async_main():
             AliTransferDriver(ali_auth)  # 阿里盘转存驱动，传入refresh_token（持久有效）
                                          # 或access_token（有效期2小时，需要以kwarg方式传入）
     ) as supervisor:
+        supervisor.persistent_load('persistent_data')  # 尝试加载持久化数据（token缓存、授权信息等）
         supervisor.persistent_dump('persistent_data')  # 保存持久化数据（token缓存、授权信息等）
 
 
