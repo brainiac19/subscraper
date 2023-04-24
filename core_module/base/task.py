@@ -20,10 +20,14 @@ class Task:
         self.task_name = None
 
     def start(self):
+        if self.started:
+            return
         self.start_time = time.time()
         self.status = Status.STARTED
 
     def finish(self, success):
+        if self.finished:
+            return
         self.finish_time = time.time()
         self.status = Status.SUCCESS if success else Status.ERROR
 
@@ -40,19 +44,19 @@ class Task:
 
     @property
     def started(self):
-        return True if self.status == Status.STARTED else False
+        return self.status != Status.CREATED
 
     @property
     def finished(self):
-        return True if self.status == Status.SUCCESS or self.status == Status.ERROR else False
+        return self.status == Status.SUCCESS or self.status == Status.ERROR
 
     @property
     def successful(self):
-        return True if self.status == Status.SUCCESS else False
+        return self.status == Status.SUCCESS
 
     @property
     def error(self):
-        return True if self.status == Status.ERROR else False
+        return self.status == Status.ERROR
 
 
 def tasks_completed(*tasks):

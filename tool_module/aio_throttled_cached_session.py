@@ -1,20 +1,16 @@
 """Core functions for cache configuration"""
-import warnings
+import asyncio
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from logging import getLogger
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
-from aiohttp import ClientSession
 from aiohttp.typedefs import StrOrURL
-from tool_module.aio_throttled_session import ThrottledClientSession
-
-from aiohttp_client_cache.backends import CacheBackend, get_valid_kwargs
+from aiohttp_client_cache.backends import CacheBackend
 from aiohttp_client_cache.cache_control import ExpirationTime
+from aiohttp_client_cache.cache_keys import create_key
 from aiohttp_client_cache.response import AnyResponse, set_response_defaults
-from aiohttp_client_cache.signatures import extend_signature
 
-
-logger = getLogger(__name__)
+from tool_module.aio_throttled_session import ThrottledClientSession
 
 
 class ThrottledCachedSession(ThrottledClientSession):
@@ -27,12 +23,18 @@ class ThrottledCachedSession(ThrottledClientSession):
         **kwargs,
     ):
         self.cache = cache or CacheBackend()
+        self.aggressive_cache = True
+        self._request_mutex = defaultdict(asyncio.Lock)
         super().__init__(*args, **kwargs)
 
     async def _request(
         self, method: str, str_or_url: StrOrURL, expire_after: ExpirationTime = None, **kwargs
     ) -> AnyResponse:
         """Wrapper around :py:meth:`.SessionClient._request` that adds caching"""
+        key = create_key(method, str_or_url, **kwargs)
+        if self.aggressive_cache:
+            await self._request_mutex[key].acquire()
+
         # Attempt to fetch cached response
         response, actions = await self.cache.request(
             method, str_or_url, expire_after=expire_after, **kwargs
@@ -40,17 +42,23 @@ class ThrottledCachedSession(ThrottledClientSession):
 
         # Restore any cached cookies to the session
         if response:
+            #print(f'request {str_or_url} cache found')
             self.cookie_jar.update_cookies(response.cookies or {}, response.url)
             for redirect in response.history:
                 self.cookie_jar.update_cookies(redirect.cookies or {}, redirect.url)
+            if self.aggressive_cache:
+                self._request_mutex[key].release()
+
             return response
         # If the response was missing or expired, send and cache a new request
         else:
-            logger.debug(f'Cached response not found; making request to {str_or_url}')
+            #print(f'request {str_or_url} cache not found')
             new_response = await super()._request(method, str_or_url, **kwargs)  # type: ignore
             actions.update_from_response(new_response)
             if await self.cache.is_cacheable(new_response, actions):
                 await self.cache.save_response(new_response, actions.key, actions.expires)
+            if self.aggressive_cache:
+                self._request_mutex[key].release()
             return set_response_defaults(new_response)
 
     async def close(self):
@@ -73,6 +81,14 @@ class ThrottledCachedSession(ThrottledClientSession):
         self.cache.disabled = True
         yield
         self.cache.disabled = False
+
+    @asynccontextmanager
+    async def aggressive_disabled(self):
+        """Temporarily disable the aggresive cache
+        """
+        self.aggressive_cache = False
+        yield
+        self.aggressive_cache = True
 
     async def delete_expired_responses(self):
         """Remove all expired responses from the cache"""

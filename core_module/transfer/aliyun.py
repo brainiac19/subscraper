@@ -216,7 +216,9 @@ class AliDirectoryDriver(DirectoryDriver):
                                              user_drive_id=user_drive_id,
                                              aio_session=aio_session)
         self.s = self.auth_driver.s
-        self._mkpath_mutex = asyncio.Lock()
+        self._mkdir_mutex = defaultdict(asyncio.Lock)
+        self._ls_mutex = defaultdict(asyncio.Lock)
+
 
     @staticmethod
     def retry_on_access_token_expire(func):
@@ -234,6 +236,7 @@ class AliDirectoryDriver(DirectoryDriver):
 
     @retry_on_access_token_expire
     async def _ls(self, dir_id='root'):
+        await self._ls_mutex[dir_id].acquire()
         url = 'https://api.aliyundrive.com/adrive/v3/file/list'
         json_data = {
             'drive_id': self.auth_driver.drive_id,
@@ -245,6 +248,7 @@ class AliDirectoryDriver(DirectoryDriver):
             async with self.s.post(url, json=json_data, headers=self.auth_driver.auth_header) as resp:
                 await AliResponseErrorHandler.async_handle(resp)
                 js = await resp.json()
+                self._ls_mutex[dir_id].release()
                 return js['items']
 
     async def ls(self, path: PurePosixPath | str = PurePosixPath('/'), renew=False):
@@ -287,6 +291,7 @@ class AliDirectoryDriver(DirectoryDriver):
 
     @retry_on_access_token_expire
     async def _mkdir(self, parent_file_id, name):
+        await self._mkdir_mutex[parent_file_id+'.'+name].acquire()
         url = 'https://api.aliyundrive.com/adrive/v2/file/createWithFolders'
         json_data = {
             'drive_id': self.auth_driver.drive_id,
@@ -298,15 +303,14 @@ class AliDirectoryDriver(DirectoryDriver):
         async with self.s.post(url, headers=self.auth_driver.auth_header, json=json_data) as resp:
             await AliResponseErrorHandler.async_handle(resp)
             js = await resp.json()
+            self._mkdir_mutex[parent_file_id+'.'+name].release()
             return js
 
     async def mkpath(self, path: PurePosixPath | str = PurePosixPath('/')):
         path = path if isinstance(path, PurePosixPath) else PurePosixPath(path)
-        await self._mkpath_mutex.acquire()
         dir_item = AliDirectoryItem(path.as_posix(), True)
         cached_item = await self.exists(dir_item)
         if cached_item:
-            self._mkpath_mutex.release()
             return cached_item
 
         last_cloud_id = 'root'
@@ -330,7 +334,6 @@ class AliDirectoryDriver(DirectoryDriver):
             self.cache_add(AliDirectoryItem.calc_id(partial_path.parent.as_posix(), True), cached_item)
             last_cloud_id = item['file_id']
 
-        self._mkpath_mutex.release()
         return cached_item
 
     async def close(self):
@@ -517,11 +520,14 @@ class AliTransferDriver(TransferDriver):
 
     async def _batch_transfer(self, *tasks: TransferTask):
         try:
-            mkpath_futures = []
+            ls_futures = []
             for task in tasks:
                 task.start()
+                ls_futures.append(self._loop.create_task(self._dir_driver.ls(task.target_dir)))
+
+            mkpath_futures = []
+            for task in tasks:
                 mkpath_futures.append(self._loop.create_task(self._dir_driver.mkpath(task.target_dir)))
-                await asyncio.sleep(0)
 
             share_tokens = await self._batch_get_share_token_internal(
                 [self.share_url_get_id(task.url) for task in tasks],
@@ -543,25 +549,36 @@ class AliTransferDriver(TransferDriver):
                 info = await info_future
                 if not mkpath:
                     warnings.warn(f'创建文件夹{task.target_dir}出错')
+                    task.finish(False)
                     transfer_params.append(transfer_param)
                     continue
                 if not token:
                     warnings.warn(f'{task}未获取到token')
+                    task.finish(False)
                     transfer_params.append(transfer_param)
                     continue
                 if not info_future:
                     warnings.warn(f'{task}未获取到文件信息')
+                    task.finish(False)
                     transfer_params.append(transfer_param)
                     continue
 
                 for info_item in info:
                     try:
+                        p = mkpath.path.joinpath(info_item['name'])
+                        dir_item = AliDirectoryItem(p.as_posix(),
+                                                    info_item['type'] == 'folder' or False)
+                        if await self._dir_driver.exists(dir_item):
+                            warnings.warn(f'{p.as_posix()}已存在，跳过转存')
+                            task.finish(True)
+                            transfer_params.append(transfer_param)
+                            continue
                         transfer_param = (token,
                                           info_item['file_id'],
                                           info_item['share_id'],
                                           self.auth_driver.drive_id,
                                           mkpath.cloud_id,
-                                          True if TransferFlag.rename in task.flags else False)
+                                          TransferFlag.rename in task.flags)
                     except AttributeError:
                         pass
                     transfer_params.append(transfer_param)
@@ -569,6 +586,8 @@ class AliTransferDriver(TransferDriver):
             transfer_responses = await self._batch_transfer_internal(*zip(*transfer_params))
 
             for task, resp in zip(tasks, transfer_responses):
+                if task.finished:
+                    continue
                 if resp and AliResponseErrorHandler.success(resp['status']):
                     task.finish(True)
                 else:
